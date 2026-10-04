@@ -4,6 +4,7 @@ import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     Checkpoint,
+    CheckpointHeadMismatchError,
     CheckpointMetadata,
     create_checkpoint,
     empty_checkpoint,
@@ -188,3 +189,78 @@ class TestAsyncSqliteSaver:
             # (would have been dropped if injection succeeded)
             results = [c async for c in saver.alist(None, limit=None)]
             assert len(results) == 5
+
+
+class TestAsyncExpectedCheckpointId:
+    """Async regression tests for langchain-ai/langgraph#9099 (see the sync
+    variants in test_sqlite.py for the full rationale)."""
+
+    async def _write_two_checkpoints(
+        self, saver: AsyncSqliteSaver, thread_id: str
+    ) -> tuple[str, str]:
+        config: RunnableConfig = {
+            "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+        }
+        chkpnt_1: Checkpoint = empty_checkpoint()
+        chkpnt_1["channel_values"] = {"v": "one"}
+        c1 = await saver.aput(config, chkpnt_1, {"source": "input", "step": 0}, {})
+        chkpnt_2 = create_checkpoint(chkpnt_1, None, 1)
+        chkpnt_2["channel_values"] = {"v": "two"}
+        c2 = await saver.aput(config, chkpnt_2, {"source": "loop", "step": 1}, {})
+        return c1["configurable"]["checkpoint_id"], c2["configurable"]["checkpoint_id"]
+
+    async def _delete_row(self, saver: AsyncSqliteSaver, checkpoint_id: str) -> None:
+        await saver.conn.execute(
+            "DELETE FROM checkpoints WHERE checkpoint_id = ?", (checkpoint_id,)
+        )
+        await saver.conn.commit()
+
+    async def test_deleted_head_raises_with_expected_checkpoint_id(self) -> None:
+        async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
+            old_id, head_id = await self._write_two_checkpoints(saver, "thread-1")
+            await self._delete_row(saver, head_id)
+            # without the anchor the thread silently rolls back
+            rolled = await saver.aget_tuple(
+                {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
+            )
+            assert rolled is not None
+            assert rolled.config["configurable"]["checkpoint_id"] == old_id
+            # with the anchor the missing head raises instead
+            with pytest.raises(CheckpointHeadMismatchError):
+                await saver.aget_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": "thread-1",
+                            "checkpoint_ns": "",
+                            "expected_checkpoint_id": head_id,
+                        }
+                    }
+                )
+
+    async def test_matching_head_passes(self) -> None:
+        async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
+            _, head_id = await self._write_two_checkpoints(saver, "thread-1")
+            tup = await saver.aget_tuple(
+                {
+                    "configurable": {
+                        "thread_id": "thread-1",
+                        "checkpoint_ns": "",
+                        "expected_checkpoint_id": head_id,
+                    }
+                }
+            )
+            assert tup is not None
+            assert tup.config["configurable"]["checkpoint_id"] == head_id
+
+    async def test_missing_thread_head_raises(self) -> None:
+        async with AsyncSqliteSaver.from_conn_string(":memory:") as saver:
+            with pytest.raises(CheckpointHeadMismatchError):
+                await saver.aget_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": "no-such-thread",
+                            "checkpoint_ns": "",
+                            "expected_checkpoint_id": "no-such-checkpoint",
+                        }
+                    }
+                )

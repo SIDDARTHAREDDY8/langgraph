@@ -4,6 +4,7 @@ import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     Checkpoint,
+    CheckpointHeadMismatchError,
     CheckpointMetadata,
     create_checkpoint,
     empty_checkpoint,
@@ -307,3 +308,110 @@ class TestSqliteSaver:
             # Nested digit-starting key via dotted path
             results = list(saver.list(None, filter={"user.123abc": "ok2"}))
             assert len(results) == 1
+
+
+class TestExpectedCheckpointId:
+    """Regression tests for langchain-ai/langgraph#9099.
+
+    Deleting a thread's newest checkpoint row silently made ``get_tuple()``
+    return the previous checkpoint, because nothing verified that the loaded
+    head was the authoritative latest. Supplying ``expected_checkpoint_id``
+    in the config now opts in to a head check that raises
+    ``CheckpointHeadMismatchError`` instead.
+    """
+
+    def _write_two_checkpoints(
+        self, saver: SqliteSaver, thread_id: str
+    ) -> tuple[str, str]:
+        config: RunnableConfig = {
+            "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+        }
+        chkpnt_1: Checkpoint = empty_checkpoint()
+        chkpnt_1["channel_values"] = {"v": "one"}
+        c1 = saver.put(config, chkpnt_1, {"source": "input", "step": 0}, {})
+        chkpnt_2 = create_checkpoint(chkpnt_1, None, 1)
+        chkpnt_2["channel_values"] = {"v": "two"}
+        c2 = saver.put(config, chkpnt_2, {"source": "loop", "step": 1}, {})
+        return c1["configurable"]["checkpoint_id"], c2["configurable"]["checkpoint_id"]
+
+    def _delete_row(self, saver: SqliteSaver, checkpoint_id: str) -> None:
+        saver.conn.execute(
+            "DELETE FROM checkpoints WHERE checkpoint_id = ?", (checkpoint_id,)
+        )
+        saver.conn.commit()
+
+    def test_deleted_head_raises_with_expected_checkpoint_id(self) -> None:
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            old_id, head_id = self._write_two_checkpoints(saver, "thread-1")
+            # sanity: the head reads back fine
+            plain = saver.get_tuple(
+                {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
+            )
+            assert plain is not None
+            assert plain.config["configurable"]["checkpoint_id"] == head_id
+            # attacker with store write access deletes the newest row
+            self._delete_row(saver, head_id)
+            # without the anchor the thread silently rolls back (pre-existing
+            # behavior, asserted here to pin the mechanism this fix guards)
+            rolled = saver.get_tuple(
+                {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
+            )
+            assert rolled is not None
+            assert rolled.config["configurable"]["checkpoint_id"] == old_id
+            # with the anchor the missing head raises instead
+            with pytest.raises(CheckpointHeadMismatchError):
+                saver.get_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": "thread-1",
+                            "checkpoint_ns": "",
+                            "expected_checkpoint_id": head_id,
+                        }
+                    }
+                )
+
+    def test_matching_head_passes(self) -> None:
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            _, head_id = self._write_two_checkpoints(saver, "thread-1")
+            tup = saver.get_tuple(
+                {
+                    "configurable": {
+                        "thread_id": "thread-1",
+                        "checkpoint_ns": "",
+                        "expected_checkpoint_id": head_id,
+                    }
+                }
+            )
+            assert tup is not None
+            assert tup.config["configurable"]["checkpoint_id"] == head_id
+
+    def test_missing_thread_head_raises(self) -> None:
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            with pytest.raises(CheckpointHeadMismatchError):
+                saver.get_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": "no-such-thread",
+                            "checkpoint_ns": "",
+                            "expected_checkpoint_id": "no-such-checkpoint",
+                        }
+                    }
+                )
+
+    def test_explicit_historical_read_still_checks_head(self) -> None:
+        with SqliteSaver.from_conn_string(":memory:") as saver:
+            old_id, head_id = self._write_two_checkpoints(saver, "thread-1")
+            self._delete_row(saver, head_id)
+            # reading an older checkpoint explicitly with the anchor must still
+            # notice the head is gone
+            with pytest.raises(CheckpointHeadMismatchError):
+                saver.get_tuple(
+                    {
+                        "configurable": {
+                            "thread_id": "thread-1",
+                            "checkpoint_ns": "",
+                            "checkpoint_id": old_id,
+                            "expected_checkpoint_id": head_id,
+                        }
+                    }
+                )

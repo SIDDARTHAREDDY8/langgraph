@@ -750,9 +750,33 @@ class EmptyChannelError(Exception):
     pass
 
 
+class CheckpointHeadMismatchError(Exception):
+    """Raised when a thread's current head checkpoint does not match the
+    caller-supplied expected head.
+
+    Savers can only authenticate rows that are present: a deleted newest row
+    silently makes the previous row look like the head. Supplying
+    ``expected_checkpoint_id`` (via ``config["configurable"]``) opts in to a
+    head check on point reads, so a missing or moved head raises instead of
+    silently rolling the thread back to an earlier state.
+    """
+
+    pass
+
+
 def get_checkpoint_id(config: RunnableConfig) -> str | None:
     """Get checkpoint ID."""
     return config["configurable"].get("checkpoint_id")
+
+
+def get_expected_checkpoint_id(config: RunnableConfig) -> str | None:
+    """Get the caller-supplied expected head checkpoint ID, if any.
+
+    This is an opt-in integrity anchor: it must be retained by the caller
+    outside the checkpoint store, since a marker kept in the same store can
+    be rolled back together with the rows it is meant to protect.
+    """
+    return config["configurable"].get("expected_checkpoint_id")
 
 
 def get_checkpoint_metadata(

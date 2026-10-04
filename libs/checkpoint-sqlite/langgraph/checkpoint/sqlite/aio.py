@@ -15,12 +15,14 @@ from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     ChannelVersions,
     Checkpoint,
+    CheckpointHeadMismatchError,
     CheckpointMetadata,
     CheckpointTuple,
     DeltaChannelHistory,
     SerializerProtocol,
     get_checkpoint_id,
     get_checkpoint_metadata,
+    get_expected_checkpoint_id,
 )
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
@@ -343,6 +345,39 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
 
             self.is_setup = True
 
+    async def _check_expected_head(
+        self,
+        cur: aiosqlite.Cursor,
+        config: RunnableConfig,
+        checkpoint_ns: str,
+    ) -> None:
+        """Verify the thread's current head against a caller-supplied expectation.
+
+        Raises:
+            CheckpointHeadMismatchError: If ``expected_checkpoint_id`` was
+                supplied in ``config["configurable"]`` and the thread's latest
+                checkpoint row is missing or has a different ID.
+        """
+        expected_checkpoint_id = get_expected_checkpoint_id(config)
+        if expected_checkpoint_id is None:
+            return
+        await cur.execute(
+            "SELECT checkpoint_id FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? ORDER BY checkpoint_id DESC LIMIT 1",
+            (str(config["configurable"]["thread_id"]), checkpoint_ns),
+        )
+        head_row = await cur.fetchone()
+        actual_head_id = head_row[0] if head_row else None
+        if actual_head_id != expected_checkpoint_id:
+            if actual_head_id is None:
+                detail = "no checkpoints found"
+            else:
+                detail = f"actual head is {actual_head_id}"
+            raise CheckpointHeadMismatchError(
+                f"Expected head checkpoint {expected_checkpoint_id} for thread "
+                f"{config['configurable']['thread_id']!r} (ns={checkpoint_ns!r}), "
+                f"but {detail}. The newest checkpoint row may have been deleted."
+            )
+
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database asynchronously.
 
@@ -350,6 +385,14 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
         provided config. If the config contains a `checkpoint_id` key, the checkpoint with
         the matching thread ID and checkpoint ID is retrieved. Otherwise, the latest checkpoint
         for the given thread ID is retrieved.
+
+        for the given thread ID is retrieved.
+
+        If the config contains an `expected_checkpoint_id` key, the thread's
+        current head checkpoint is verified against it before any row is
+        trusted; a missing or different head raises
+        `CheckpointHeadMismatchError` instead of silently rolling back to an
+        earlier checkpoint (see issue #9099).
 
         Args:
             config: The config to use for retrieving the checkpoint.
@@ -360,6 +403,11 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
         await self.setup()
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         async with self.lock, self.conn.cursor() as cur:
+            # Opt-in head check (see issue #9099): a deleted newest row silently
+            # makes the previous row look like the head, and row-level AAD
+            # cannot detect a removal. If the caller supplied an expected head,
+            # verify the thread's actual head matches before trusting any row.
+            await self._check_expected_head(cur, config, checkpoint_ns)
             # find the latest checkpoint for the thread_id
             if checkpoint_id := get_checkpoint_id(config):
                 await cur.execute(
