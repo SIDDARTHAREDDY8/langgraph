@@ -5,6 +5,7 @@ import json
 import logging
 import operator
 import random
+import sqlite3
 import threading
 import time
 import uuid
@@ -46,6 +47,7 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.store.base import BaseStore
 from langsmith import traceable
@@ -9854,3 +9856,66 @@ async def test_delta_channel_async_write_ordering() -> None:
 
     state = await graph.aget_state(config)
     assert len(state.values["messages"]) == 6  # 3 human + 3 AI
+
+
+@pytest.mark.parametrize("durability", ["sync", "async", "exit"])
+def test_checkpoints_committed_before_first_node(
+    durability: Durability, tmp_path: Any
+) -> None:
+    """Pin the durability contract for the start of a run (see #8764).
+
+    From inside the first user node, count the checkpoints a fresh process
+    could already see for the thread:
+
+    - `"sync"`: the `input` (step -1) and step-0 checkpoints are committed
+      before the first node executes, so an accepted run always leaves a
+      durable trace unless the process dies *during* the first checkpoint
+      write itself (which no ordering can prevent).
+    - `"async"`: the input checkpoint write is submitted but never waited
+      on, so no ordering is asserted -- only that the observed count is sane.
+    - `"exit"`: nothing is persisted until the run ends, so a crash mid-run
+      leaves no trace of the thread.
+    """
+    db = tmp_path / "checkpoints.sqlite"
+    observed: dict[str, int] = {}
+
+    class GraphState(TypedDict):
+        done: bool
+
+    def node(node_state: GraphState) -> GraphState:
+        # fresh connection: only committed rows are visible, exactly what a
+        # fresh recovery process would see after a crash at this point
+        with sqlite3.connect(db) as read_conn:
+            observed["committed"] = read_conn.execute(
+                "select count(*) from checkpoints"
+            ).fetchone()[0]
+        return {"done": True}
+
+    builder = StateGraph(GraphState)
+    builder.add_node("node", node)
+    builder.add_edge(START, "node")
+    builder.add_edge("node", END)
+
+    write_conn = sqlite3.connect(db, check_same_thread=False)
+    saver = SqliteSaver(write_conn)
+    saver.setup()
+    graph = builder.compile(checkpointer=saver)
+    try:
+        out = graph.invoke(
+            {"done": False},
+            {"configurable": {"thread_id": "accepted-run"}},
+            durability=durability,
+        )
+        assert out == {"done": True}
+    finally:
+        write_conn.close()
+
+    assert "committed" in observed
+    if durability == "sync":
+        # input checkpoint + step-0 checkpoint, both durable
+        assert observed["committed"] == 2
+    elif durability == "exit":
+        assert observed["committed"] == 0
+    else:
+        # async: write submitted before the node runs, but not waited on
+        assert observed["committed"] in (0, 1, 2)
